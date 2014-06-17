@@ -96,8 +96,7 @@ class SensirionSHTC1(Peripheral):
 
     def __repr__(self):
         """Repr for class."""
-        ret = '<%s@%s: %s / %s>' % (self.__class__, id(self),
-                                    self.services, self.sensors.keys())
+        ret = '%s@%s' % (self.__class__.__name__, id(self))
         return ret
 
 if __name__ == "__main__":
@@ -125,7 +124,7 @@ if __name__ == "__main__":
                     print('%s(%s): %s' % (sensor.name,
                                           sensor.periph.deviceAddr,
                                           sensor.read()))
-                time.sleep(5.0)
+            time.sleep(5.0)
     except Exception as e:
         print(e)
         for device in devices:

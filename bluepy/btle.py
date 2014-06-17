@@ -1,14 +1,11 @@
-"""Bluetooth Low Energy Python interface"""
+"""Bluetooth Low Energy Python interface."""
+
 import sys
 import os
 import time
 import subprocess
 import binascii
 
-Debugging = False
-helperExe = os.path.join(os.path.abspath(os.path.dirname(__file__)), "bluepy-helper")
-if not os.path.isfile(helperExe):
-    raise ImportError("Cannot find required executable '%s'" % helperExe)
 
 SEC_LEVEL_LOW = "low"
 SEC_LEVEL_MEDIUM = "medium"
@@ -98,8 +95,12 @@ class Service:
                                                                  self.hndEnd)
 
 class Characteristic:
-    def __init__(self, *args):
-        (self.peripheral, uuidVal, self.handle, self.properties, self.valHandle) = args
+    def __init__(self, peripheral, uuidVal, handle, properties, valHandle):
+        self.peripheral = peripheral
+        self.uuidVal = uuidVal
+        self.handle = handle
+        self.properties = properties
+        self.valHandle = valHandle
         self.uuid = UUID(uuidVal)
 
     def read(self):
@@ -121,13 +122,9 @@ class Descriptor:
     def __str__(self):
         return "Descriptor <%s>" % self.uuid
 
-class Peripheral:
-    def __init__(self, deviceAddr=None):
-        self._helper = None
-        self.services = {} # Indexed by UUID
-        self.discoveredAllServices = False
-        if deviceAddr is not None:
-            self.connect(deviceAddr)
+
+class BasePeripheral(object):
+    _helper = None
 
     def _startHelper(self):
         if self._helper is None:
@@ -144,13 +141,61 @@ class Peripheral:
             self._helper.wait()
             self._helper = None
 
-    def _writeCmd(self, cmd):
+    def _write(self, cmd):
         if self._helper is None:
             raise BTLEException(BTLEException.INTERNAL_ERROR,
                                 "Helper not started (did you call connect()?)")
         DBG("Sent: ", cmd)
         self._helper.stdin.write(cmd)
 
+
+    def _getResp(self, wantType):
+        while True:
+            if self._helper.poll() is not None:
+                raise BTLEException(BTLEException.INTERNAL_ERROR,
+                                    "Helper exited")
+
+            rv = self._helper.stdout.readline()
+            DBG("Got:", repr(rv))
+            if not rv.startswith('#'):
+                resp = Peripheral.parseResp(rv)
+                break
+        if 'rsp' not in resp:
+            raise BTLEException(BTLEException.INTERNAL_ERROR,
+                                "No response type indicator")
+        respType = resp['rsp'][0]
+        if respType == wantType:
+            return resp
+        elif respType == 'stat' and resp['state'][0] == 'disc':
+            self._stopHelper()
+            raise BTLEException(BTLEException.DISCONNECTED, "Device disconnected")
+        elif respType == 'err':
+            errcode=resp['code'][0]
+            raise BTLEException(BTLEException.COMM_ERROR, "Error from Bluetooth stack (%s)" % errcode)
+        else:
+            raise BTLEException(BTLEException.INTERNAL_ERROR, "Unexpected response (%s)" % respType)
+
+    def connect(self, addr):
+        self.deviceAddr = addr
+        self._writeCmd("conn %s\n" % addr)
+
+    def disconnect(self):
+        if self._helper is None:
+            return
+        self._writeCmd("disc\n")
+
+class Peripheral(BasePeripheral):
+    def __init__(self, deviceAddr=None):
+        super(Peripheral, self).__init__()
+
+        self.services = {} # Indexed by UUID
+        self.discoveredAllServices = False
+        if deviceAddr is not None:
+            self.connect(deviceAddr)
+
+    def _writeCmd(self, cmd):
+        super(Peripheral, self)._write(cmd)
+        DBG("Sent: ", cmd)
 
     @staticmethod
     def parseResp(line):
@@ -208,8 +253,7 @@ class Peripheral:
         if len(addr.split(":")) != 6:
             raise ValueError("Expected MAC address, got %s", repr(addr))
         self._startHelper()
-        self.deviceAddr = addr
-        self._writeCmd("conn %s\n" % addr)
+        super(Peripheral, self).connect(addr)
         rsp = self._getResp('stat')
         while rsp['state'][0] == 'tryconn':
             rsp = self._getResp('stat')
@@ -221,9 +265,11 @@ class Peripheral:
     def disconnect(self):
         if self._helper is None:
             return
-        self._writeCmd("disc\n")
+        super(Peripheral, self).disconnect()
         self._getResp('stat')
         self._stopHelper()
+        # make the function idempotent
+        self._helper = None
 
     def discoverServices(self):
         self._writeCmd("svcs\n")
@@ -331,11 +377,17 @@ class AssignedNumbers:
     def getCommonName(uuid):
         return AssignedNumbers.nameMap.get(uuid, None)
 
+
 if __name__ == '__main__':
     if len(sys.argv) < 2:
         sys.exit("Usage:\n  %s <mac-address>" % sys.argv[0])
 
     Debugging = False
+    helperExe = os.path.join(os.path.abspath(os.path.dirname(__file__)),
+                             "bluepy-helper")
+    if not os.path.isfile(helperExe):
+        raise ImportError("Cannot find required executable '%s'" % helperExe)
+
     devaddr = sys.argv[1]
     print("Connecting to:", devaddr)
     conn = Peripheral(devaddr)
@@ -348,4 +400,5 @@ if __name__ == '__main__':
                 if chName is not None:
                     print("    ->", chName, repr(ch.read()))
     finally:
-        conn.disconnect()
+        if conn is not None:
+            conn.disconnect()
