@@ -9,115 +9,11 @@ import subprocess
 
 from functools import partial
 
+from .btle import BTLEException, AssignedNumbers
 
 SEC_LEVEL_LOW = "low"
 SEC_LEVEL_MEDIUM = "medium"
 SEC_LEVEL_HIGH = "high"
-
-BASE_UUID = "00001000800000805F9B34FB"
-
-
-def DBG(*args):
-    logging.debug(*args)
-
-
-class BTLEException(Exception):
-
-    """BTLE Exception."""
-
-    DISCONNECTED = 1
-    COMM_ERROR = 2
-    INTERNAL_ERROR = 3
-    errmap = {
-        DISCONNECTED: 'Disconnected',
-        COMM_ERROR: 'Communication Error',
-        INTERNAL_ERROR: 'Internal Error'
-    }
-
-    def __init__(self, code, message):
-        assert code in self.errmap
-        self.code = code
-        self.message = message
-
-    def __str__(self):
-        return '%d: %s' % (self.errmap[self.code], self.message)
-
-
-class UUID:
-
-    """Object representing a UUID"""
-
-    binary = None  # binary form
-
-    def __init__(self, val):
-        '''We accept: 32-digit hex strings, with and without '-' characters,
-        4 to 8 digit hex strings, and integers'''
-        if isinstance(val, int):
-            if (val < 0) or (val > 0xFFFFFFFF):
-                raise ValueError(
-                    "Short form UUIDs must be in range 0..0xFFFFFFFF")
-            val = "%04X" % val
-        elif isinstance(val, self.__class__):
-            # if it's already an instance, normalization and sanity checks have
-            # already been perfomed. Set the binary value and return!
-            self.binary = val.binary
-            return
-        else:
-            val = str(val)  # Do our best
-
-        # Normalize
-        val = val.replace("-", "")
-        if len(val) <= 8:  # Short form
-            # pad the value and append the base UUID
-            val = ("0" * (8 - len(val))) + val + BASE_UUID
-
-        self.binary = binascii.a2b_hex(val)
-        if len(self.binary) != 16:
-            raise ValueError(
-                "UUID must be 16 bytes, got '%s' (len=%d)" % (
-                    val, len(self.binary)))
-
-    def __str__(self):
-        s = binascii.b2a_hex(self.binary).decode('utf-8')
-        return "-".join([s[0:8], s[8:12], s[12:16], s[16:20], s[20:32]])
-
-    def __eq__(self, other):
-        return self.binary == UUID(other).binary
-
-    def __cmp__(self, other):
-        return cmp(self.binary, UUID(other).binary)
-
-    def __hash__(self):
-        return hash(self.binary)
-
-
-class CallbackChain(object):
-    chained_args = tuple()
-    chained_kw = dict()
-
-    def __init__(self, cb, *args, **kw):
-        self.queue = queue.Queue()
-        self.partial_cb = partial(cb, *args, **kw)
-
-    def set_result(self, value):
-        self.result = value
-
-    def __call__(self, *args, **kw):
-        self.result = self.partial_cb(result=self.result, *args, **kw)
-        return self.result
-
-    def concatenate(self, cb):
-        assert isinstance(cb, self.__class__)
-        self.queue.put(cb)
-
-    def __next__(self):
-        try:
-            queued = self.queue.get_nowait()
-            # propagate (i.e. chain!) the requested chained parameters
-            queued.set_result(self.result)
-            return queued
-        except queue.Empty:
-            return None
 
 
 class Service:
@@ -131,7 +27,7 @@ class Service:
 
     def getCharacteristics(self, forUUID=None, chars_cb=None):
         def set_chars(srv, forUUID, result=None):
-            DBG('getCharacteristics cb: result %s' % result)
+            logging.debug('getCharacteristics cb: result %s' % result)
             assert isinstance(result, dict)
 
             srv.characteristics = result
@@ -139,7 +35,7 @@ class Service:
             if forUUID is not None:
                 u = UUID(forUUID)
                 cb_result = [ch for ch in srv.characteristics if ch.uuid == u]
-                DBG('forUUID=%s, result now is %s' % (forUUID, cb_result))
+                logging.debug('forUUID=%s, result now is %s' % (forUUID, cb_result))
 
             return cb_result
 
@@ -149,7 +45,7 @@ class Service:
         if not self.characteristics:  # Unset, or empty
             self.protocol.getCharacteristics(self.hndStart, self.hndEnd, cb)
         else:
-            final_cb = partial(chars_cb, result=self.characteristics)
+            final_cb = CallbackChain(chars_cb, result=self.characteristics)
             self.protocol.enqueue_cb(final_cb)
 
     def __str__(self):
@@ -170,8 +66,8 @@ class Characteristic(object):
 
     def read(self):
         def cb(response_):
-            DBG("Characteristic.read CB: whole resp %s" % response_)
-            DBG("Characteristic.read CB: interesting %s" % response_['d'][0])
+            logging.debug("Characteristic.read CB: whole resp %s" % response_)
+            logging.debug("Characteristic.read CB: interesting %s" % response_['d'][0])
         self.protocol.send("rd %X" % self.handle, type_='rd', cb=cb)
 
     def write(self, val, withResponse=False):
@@ -224,7 +120,7 @@ class BLEHelperProcess(object):
     def start(self, restart=False):
         if self.started:
             if restart:
-                DBG('restart=True: restaring helper')
+                logging.debug('restart=True: restaring helper')
                 self.stop()
             else:
                 return
@@ -239,13 +135,13 @@ class BLEHelperProcess(object):
         if not self.started:
             return
 
-        DBG("Stopping ", self.__path)
+        logging.debug("Stopping ", self.__path)
         self.process.stdin.write("quit\n")
         stdout, stderr = self.process.communicate()
         self.process = None
-        DBG("process terminated. Output on exit: %s" % stdout)
+        logging.debug("process terminated. Output on exit: %s" % stdout)
         if stderr:
-            DBG("Stderr on exit: %s" % stdout)
+            logging.debug("Stderr on exit: %s" % stdout)
 
     def is_alive(self):
         self.exitcode = self.process.poll()
@@ -274,7 +170,7 @@ class Transport(object):
 
         stdin = self.process.stdin if file_ is None else file_
 
-        DBG('writeline: sent %s' % data)
+        logging.debug('writeline: sent %s' % data)
         return stdin.write(data + '\n')
 
     def readline(self, l=None, file_=None):
@@ -287,7 +183,7 @@ class Transport(object):
         stdout = self.process.stdout if file_ is None else file_
 
         data = stdout.readline()
-        DBG('readline: %s' % data)
+        logging.debug('readline: %s' % data)
         return data
 
     def connect(self, addr):
@@ -323,10 +219,10 @@ class Protocol(object):
         parsed = self.parse_line(line)
 
         if 'rsp' not in parsed:
-            DBG('receive_line: "rsp" response type not found: %s', parsed)
+            logging.debug('receive_line: "rsp" response type not found: %s', parsed)
             return
 
-        DBG('receive_line: response: %s', parsed)
+        logging.debug('receive_line: response: %s', parsed)
         response_type = parsed['rsp'][0]
         self.trigger_callbacks_for_response_type(response_type, parsed)
 
@@ -336,12 +232,12 @@ class Protocol(object):
         def queued_callback_generator(q):
             try:
                 cb = q.get_nowait()
-                yield partial(cb, response_=response)
+                yield CallbackChain(cb, response_=response)
             except queue.Empty:
                 return
 
         for cb in queued_callback_generator(q):
-            DBG('calling cb %s', cb)
+            logging.debug('calling cb %s', cb)
             cb()
 
     @staticmethod
@@ -380,15 +276,16 @@ class Protocol(object):
         # format is:
         # 'comment' present if comment found.
         # 'rsp' present if a response found.
-        DBG('parse_line: resp %s', resp)
+        logging.debug('parse_line: resp %s', resp)
         return resp
 
     def wait_for_reponse_type(self, type_, cb, *args, **kw):
         """Wait to be called back when a selected response arrives"""
         if 'response_' in kw:
-            raise RuntimeError('response_ kw arg passed to cb %s' % cb)
-        partial_cb = partial(cb, *args, **kw)
-        self._append_response_queue_for_type(type_, partial_cb)
+            raise RuntimeError('response_ kw arg passed as arg to cb %s' % cb)
+
+        callback_chain = CallbackChain(cb, *args, **kw)
+        self._append_response_queue_for_type(type_, callback_chain)
 
     def _call_cb_async(cb, *args, **kw):
         cb(*args, **kw)
@@ -429,7 +326,7 @@ class Protocol(object):
                                                          starts[i], ends[i])
             self.discoveredAllServices = True
             # TODO KA worth to trigger an action/callback
-            DBG('discoveredAllServices: %s' % self.services)
+            logging.debug('discoveredAllServices: %s' % self.services)
             disc_cb(result=self.services.values(), *disc_args, **disc_kw)
 
         self.wait_for_reponse_type('svcs', cb, self)
@@ -463,7 +360,7 @@ class Protocol(object):
             cmd += ' %s' % UUID(uuid)
 
         def cb(response_):
-            DBG("getCharacteristics: cb resp=%s" % response_)
+            logging.debug("getCharacteristics: cb resp=%s" % response_)
             nChars = len(response_['hnd'])
             ret = [Characteristic(self,
                                   response_['uuid'][i],
@@ -471,8 +368,8 @@ class Protocol(object):
                                   response_['props'][i],
                                   response_['vhnd'][i])
                    for i in range(nChars)]
-            DBG("getCharacteristics return %s" % ret)
-            DBG("calling char cb")
+            logging.debug("getCharacteristics return %s" % ret)
+            logging.debug("calling char cb")
             chars_cb(result=ret, *chars_args, **chars_kw)
 
         self.send(cmd, type_='find', cb=cb)
@@ -483,8 +380,8 @@ class Protocol(object):
             nDesc = len(response_['hnd'])
             ret = [Descriptor(self, response_['uuid'][i], response_['hnd'][i])
                    for i in range(nDesc)]
-            DBG("getDescriptors result %s" % ret)
-            DBG("calling desc cb")
+            logging.debug("getDescriptors result %s" % ret)
+            logging.debug("calling desc cb")
             desc_cb(result=ret, *desc_args, **desc_kw)
 
         self.send("desc %X %X\n" % (startHnd, endHnd), type_='desc', cb=cb)
@@ -497,7 +394,7 @@ class Protocol(object):
     def writeCharacteristic(self, handle, val, withResponse=False,
                             write_cb=None, *write_args, **write_kw):
         def cb(response_):
-            DBG("writeCharacteristic resp %s" % response_)
+            logging.debug("writeCharacteristic resp %s" % response_)
             write_cb(result=response_['wr'], *write_args, **write_kw)
 
         cmd = "wrr" if withResponse else "wr"
@@ -512,59 +409,3 @@ class Protocol(object):
 #    def setMTU(self, mtu):
 #        self._writeCmd("mtu %x\n" % mtu)
 #        return self._getResp('stat')
-
-
-class AssignedNumbers:
-    # TODO: full list
-    deviceName = UUID("2A00")
-    txPowerLevel = UUID("2A07")
-    batteryLevel = UUID("2A19")
-    modelNumberString = UUID("2A24")
-    serialNumberString = UUID("2A25")
-    firmwareRevisionString = UUID("2A26")
-    hardwareRevisionString = UUID("2A27")
-    softwareRevisionString = UUID("2A28")
-    manufacturerNameString = UUID("2A29")
-
-    nameMap = {
-        deviceName: "Device Name",
-        txPowerLevel: "Tx Power Level",
-        batteryLevel: "Battery Level",
-        modelNumberString: "Model Number String",
-        serialNumberString: "Serial Number String",
-        firmwareRevisionString: "Firmware Revision String",
-        hardwareRevisionString: "Hardware Revision String",
-        softwareRevisionString: "Software Revision String",
-        manufacturerNameString: "Manufacturer Name String",
-    }
-
-    @staticmethod
-    def getCommonName(uuid):
-        assert isinstance(uuid, UUID), '%s not a UUID instance' % uuid
-        return AssignedNumbers.nameMap.get(uuid, None)
-
-
-# if __name__ == '__main__':
-#    if len(sys.argv) < 2:
-#        sys.exit("Usage:\n  %s <mac-address>" % sys.argv[0])
-#
-#    Debugging = False
-#    helperExe = os.path.join(os.path.abspath(os.path.dirname(__file__)),
-#                             "bluepy-helper")
-#    if not os.path.isfile(helperExe):
-#        raise ImportError("Cannot find required executable '%s'" % helperExe)
-#
-#    devaddr = sys.argv[1]
-#    print("Connecting to:", devaddr)
-#    conn = Transport(devaddr)
-#    try:
-#        for svc in conn.getServices():
-#            print(str(svc), ":")
-#            for ch in svc.getCharacteristics():
-#                print("    " + str(ch))
-#                chName = AssignedNumbers.getCommonName(ch.uuid)
-#                if chName is not None:
-#                    print("    ->", chName, repr(ch.read()))
-#    finally:
-#        if conn is not None:
-#            conn.disconnect()
