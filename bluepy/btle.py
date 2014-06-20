@@ -31,7 +31,7 @@ class BTLEException(Exception):
         self.message = message
 
     def __str__(self):
-        return self.message
+        return '%d: %s' % (self.errmap[self.code], self.message)
 
 
 class UUID:
