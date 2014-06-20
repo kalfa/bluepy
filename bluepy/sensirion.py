@@ -49,9 +49,9 @@ class SensorBase(object):
 
 class HumiditySensor(SensorBase):
 
-    """Humidity sensor."""
+    """SensorBase SHTC1 RH/Temp sensor."""
 
-    name = 'TempRH'
+    name = 'Sensirion SHTC1 RH/Temp Sensor'
 
     sensorOn = sensorOff = None
     svcUUID = _TI_UUID(0xAA20)
@@ -73,11 +73,10 @@ class HumiditySensor(SensorBase):
         """Return (ambient_temp, target_temp) in degC."""
         # See
         # http://processors.wiki.ti.com/index.php/SensirionSHTC1_User_Guide#IR_Temperature_Sensor
-        data = SensorBase.read(self)
-        temp, humidity = struct.unpack('<hh', data)
-        temp = float('%s.%s' % (str(temp)[:2], str(temp)[2:]))
-        humidity = float('%s.%s' % (str(humidity)[:2], str(humidity)[2:]))
-        return temp, humidity
+        temp, humidity = struct.unpack('<hh', self.read())
+        #temp = float('%s.%s' % (str(temp)[:2], str(temp)[2:]))
+        #humidity = float('%s.%s' % (str(humidity)[:2], str(humidity)[2:]))
+        return temp/100, humidity/100
 
 
 
