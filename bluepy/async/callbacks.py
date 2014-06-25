@@ -1,6 +1,9 @@
 """Callback classes"""
 
+
+import logging
 import queue
+
 from functools import partial
 
 
@@ -96,6 +99,11 @@ class CallbackChain(queue.Queue):
     result = None
 
     def __init__(self, cb, *args, **kw):
+        # if cb is an instance of CallbackChain, it will trigger a double
+        # passing of result_ at __call__ time. Instead of work around it, it's
+        # cleaner if cb is required to not be an instance of CallbackChain.
+        assert not isinstance(cb, type(self)), \
+            "cb is not an instance of %s" % type(self)
         self.partial_cb = partial(cb, *args, **kw)
         super(CallbackChain, self).__init__()
 
@@ -103,6 +111,7 @@ class CallbackChain(queue.Queue):
         self.partial_cb = partial(self.partial_cb, *args, **kw)
 
     def set_result(self, value):
+        assert self.result is None, "result has not been set yet"
         self.result = value
 
     def put(self, cb):
@@ -122,7 +131,7 @@ class CallbackChain(queue.Queue):
             queued.set_result(self.result)
             return queued
         except queue.Empty:
-            raise StopIteration
+            raise StopIteration()
 
     def __iter__(self):
         return self
@@ -130,3 +139,6 @@ class CallbackChain(queue.Queue):
     def __call__(self, *args, **kw):
         self.result = self.partial_cb(result_=self.result, *args, **kw)
         return self.result
+
+    def __str__(self):
+        return str(self.partial_cb)

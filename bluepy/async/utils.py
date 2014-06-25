@@ -1,6 +1,7 @@
 """Utilities for btle"""
 
 import binascii
+import logging
 
 BASE_UUID = "00001000800000805F9B34FB"
 

@@ -1,6 +1,7 @@
 from unittest import TestCase, mock
 
-from async.callbacks import CallbackChain
+from bluepy.async.callbacks import CallbackChain
+
 
 def identity(result_):
     return result_
@@ -104,4 +105,9 @@ class TestCallbackChain(TestCase):
 
         cb = next(unit)
         cb()
-        cb3.assert_called_once_with(result_=expected_result)
+
+    def test_nested_instances_do_not_set_result_twice(self):
+        unit = CallbackChain(identity)
+
+        with self.assertRaises(AssertionError):
+            double = CallbackChain(unit)

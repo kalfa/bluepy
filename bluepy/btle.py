@@ -1,11 +1,14 @@
-"""Bluetooth Low Energy Python interface."""
-
+"""Bluetooth Low Energy Python interface"""
 import sys
 import os
 import time
 import subprocess
 import binascii
 
+Debugging = False
+#helperExe = os.path.join(os.path.abspath(os.path.dirname(__file__)), "bluepy-helper")
+#if not os.path.isfile(helperExe):
+#    raise ImportError("Cannot find required executable '%s'" % helperExe)
 
 SEC_LEVEL_LOW = "low"
 SEC_LEVEL_MEDIUM = "medium"
@@ -31,7 +34,7 @@ class BTLEException(Exception):
         self.message = message
 
     def __str__(self):
-        return '%d: %s' % (self.errmap[self.code], self.message)
+        return self.message
 
 
 class UUID:
@@ -93,21 +96,14 @@ class Service:
         return "Service <uuid=%s hadleStart=%s handleEnd=%s>" % (self.uuid,
                                                                  self.hndStart,
                                                                  self.hndEnd)
-# KA: touch, unstable
-class Characteristic(BasePeripheral):
-    def __init__(self, uuidVal, handle, properties, valHandle):
-        self.uuidVal = uuidVal
-        self.handle = handle
-        self.properties = properties
-        self.valHandle = valHandle
+
+class Characteristic:
+    def __init__(self, *args):
+        (self.peripheral, uuidVal, self.handle, self.properties, self.valHandle) = args
         self.uuid = UUID(uuidVal)
 
     def read(self):
-        self._writeCmd("rd %X\n" % self.handle)
-        resp = self._getResp('rd')
-        return resp['d'][0]
-
-
+        return self.peripheral.readCharacteristic(self.valHandle)
 
     def write(self, val, withResponse=False):
         self.peripheral.writeCharacteristic(self.valHandle, val, withResponse)
@@ -125,242 +121,127 @@ class Descriptor:
     def __str__(self):
         return "Descriptor <%s>" % self.uuid
 
-
-class BLEHelperProcess(object):
-
-    """BluePy Helper is a line based daemon which connects to a device.
-
-    BluePy Helper uses Bluez to access a remote BLE device and interacts with
-    it using a line oriented human readable text interface.
-
-    An instance per device is required.
-
-    This class interacts with the helper process.
-    """
-    __path = None
-    stdin = stdout = stderr = subprocess.PIPE
-    exitcode = None
-
-    def __init__(self, path, stdin=None, stdout=None, stderr=None, nonblocking=False):
-        self.started = False
-        self.__path = path
-        if stdin is not None:
-            self.stdin = stdin
-
-        if stdout is not None:
-            self.stdout = stdout
-
-        if stderr is not None:
-            self.stderr = stderr
-
-    def start(self, restart=False):
-        if self.started:
-            if restart:
-                logging.debug('restart=True: restaring helper')
-                self.stop()
-            else:
-                return
-
-        self.process = subprocess.Popen([self.__path],
-                                        stdin=self.stdin,
-                                        stdout=self.stdout,
-                                        stderr=self.stderr,
-                                        universal_newlines=True)
-
-    def stop(self):
-        if not self.started:
-            return
-
-        DBG("Stopping ", helperExe)
-        self.process.stdin.write("quit\n")
-        stdout, stderr = self.process.communicate()
-        self.process = None
-        DBG("process terminated. Output on exit: %s" % stdout)
-        if stderr:
-            DBG("Stderr on exit: %s" % stdout)
-
-    def is_alive(self):
-        self.exitcode = self.process.poll()
-        return self._exitcode is None
-
-
-
-class Transport(object):
-    def __init__(self, process=None):
-        if process is not None:
-            self.process = process
-        else:
-            helper_path = os.path.join(
-                os.path.abspath(os.path.dirname(__file__)),
-                "bluepy-helper")
-
-            self.process = BLEHelperProcess(helper_path)
-
-    def writeline(self, data, file_=None):
-        assert isinstance(file_, (io.TextIOBase, type(None))), \
-            'file is None or a file object instance'
-        assert data[-1] != '\n', 'newline character not present'
-
-        if self.process is None:
-            raise BTLEException(BTLEException.INTERNAL_ERROR,
-                                "Helper not started")
-
-        stdin = self.process.stdin if file_ is None else file_
-
-        DBG('writeline: sent %s' % data)
-        return stdin.write(data + '\n')
-
-    def readline(self, l=None, file_=None):
-        assert isinstance(file_, (io.TextIOBase, type(None)))
-
-        if self.process.is_alive():
-            raise BTLEException(BTLEException.INTERNAL_ERROR,
-                                "Helper exited")
-
-        stdout = self.process.stdout if file_ is None else file_
-
-        data = stdout.readline()
-        DBG('readline: %s' % data)
-        return data
-
-    def connect(self, addr):
-        assert len(addr.split(":")) != 6, "expected MAC, got %s", addr
-
-        self.deviceAddr = addr
-        self.write("conn %s" % addr)
-
-    def check_connect_response(self):
-        line = self.readline()
-        r = self.parse_line(line)
-        return 'conn' in r
-
-    def disconnect(self):
-        if self.process is None:
-            return
-        self.write("disc")
-
-
-class Protocol(object):
+class Peripheral:
     def __init__(self, deviceAddr=None):
+        self._helper = None
         self.services = {} # Indexed by UUID
         self.discoveredAllServices = False
+        if deviceAddr is not None:
+            self.connect(deviceAddr)
 
-    def setUp(self, transport):
-        assert isinstance(transport, Transport)
+    def _startHelper(self):
+        if self._helper is None:
+            DBG("Running ", helperExe)
+            self._helper = subprocess.Popen([helperExe],
+                                            stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE,
+                                            universal_newlines=True)
 
-        self.transport = transport
+    def _stopHelper(self):
+        if self._helper is not None:
+            DBG("Stopping ", helperExe)
+            self._helper.stdin.write("quit\n")
+            self._helper.wait()
+            self._helper = None
 
+    def _writeCmd(self, cmd):
+        if self._helper is None:
+            raise BTLEException(BTLEException.INTERNAL_ERROR,
+                                "Helper not started (did you call connect()?)")
+        DBG("Sent: ", cmd)
+        self._helper.stdin.write(cmd)
 
-    def receive_line(self, line):
-        parsed = self.parse_line(line)
-
-        if 'rsp' not in parsed:
-            DBG('receive_line: "rsp" response type not found: %s', parsed)
-            return
-
-        response_type = parsed['rsp'][0]
-        self.trigger_callbacks_for_response_type(response_type, parsed)
-
-    def trigger_callbacks_for_response_type(self, type_, response):
-        q = self.get_callbacks_queue_for_type(type_)
-        def queued_callback_generator(q):
-            try:
-                cb = q.get_nowait()
-                yield cb(response=response)
-            except queue.Empty:
-                return
-
-        for cb in queued_callback_generator(q):
-            DBG('calling cb %s', q)
-            cb()
 
     @staticmethod
-    def parse_line(line):
+    def parseResp(line):
         resp = {}
-
-        line, comment = line.strip().split('#', 1)
-        resp['comment'] = comment
-
-        if len(line) == 0:
-            return resp
-
-        for item in line.split(' '):
-            # the assumption is that if there is a non-empty line, there are
-            # also tag/tval values in it
-            tag, text_val = item.split('=')
-            if not text_val:
+        for item in line.rstrip().split(' '):
+            (tag, tval) = item.split('=')
+            if len(tval)==0:
                 val = None
-            elif text_val[0] == "$" or text_val[0] == "'":
+            elif tval[0]=="$" or tval[0]=="'":
                 # Both symbols and strings as Python strings
-                val = text_val[1:]
-            elif text_val[0] == "h":
-                # base 16 string to integer
-                val = int(text_val[1:], base=16)
-            elif text_val[0] == 'b':
-                # string represantion of hex data to binary (bytes)
-                val = binascii.a2b_hex(text_val[1:])
+                val = tval[1:]
+            elif tval[0]=="h":
+                val = int(tval[1:], 16)
+            elif tval[0]=='b':
+                val = binascii.a2b_hex(tval[1:])
             else:
                 raise BTLEException(BTLEException.INTERNAL_ERROR,
-                                    "Cannot understand response value %s" %
-                                    repr(tval))
+                             "Cannot understand response value %s" % repr(tval))
             if tag not in resp:
                 resp[tag] = [val]
             else:
                 resp[tag].append(val)
-        # format is:
-        # 'comment' present if comment found.
-        # 'rsp' present if a response found.
-        DBG('parse_line: resp %s', resp)
         return resp
 
-    def wait_for_reponse_type(self, type_, cb, *args, **kw):
-        cb = partial(cb, *args, **kw)
-        self._append_response_queue_for_type(type_, partial_cb)
+    def _getResp(self, wantType):
+        while True:
+            if self._helper.poll() is not None:
+                raise BTLEException(BTLEException.INTERNAL_ERROR, "Helper exited")
 
-    def get_callbacks_queue_for_type(self, type_):
-        return self.__awaiting_responses[type_]
-
-    def _append_response_queue_for_type(self, type_, partial_cb)
-        q = self.__awaiting_responses.get(type_, None)
-        if q is None:
-            q = Queue()
-        q.put(partial_cb)
-
-    def send(self, cmd):
-        self.wait_for_reponse_type
-        self.transport.writeline(cmd)
+            rv = self._helper.stdout.readline()
+            DBG("Got:", repr(rv))
+            if not rv.startswith('#'):
+                resp = Peripheral.parseResp(rv)
+                break
+        if 'rsp' not in resp:
+            raise BTLEException(BTLEException.INTERNAL_ERROR,
+                                "No response type indicator")
+        respType = resp['rsp'][0]
+        if respType == wantType:
+            return resp
+        elif respType == 'stat' and resp['state'][0] == 'disc':
+            self._stopHelper()
+            raise BTLEException(BTLEException.DISCONNECTED, "Device disconnected")
+        elif respType == 'err':
+            errcode=resp['code'][0]
+            raise BTLEException(BTLEException.COMM_ERROR, "Error from Bluetooth stack (%s)" % errcode)
+        else:
+            raise BTLEException(BTLEException.INTERNAL_ERROR, "Unexpected response (%s)" % respType)
 
     def status(self):
-        def cb(response):
-            print('CB RESPONSE IS %s' % response)
-            assert response['rsp'] == 'svcs'
+        self._writeCmd("stat\n")
+        return self._getResp('stat')
 
-        self.wait_for_reponse_type('stat', cb)
-        self.send('stat')
+    def connect(self, addr):
+        if len(addr.split(":")) != 6:
+            raise ValueError("Expected MAC address, got %s", repr(addr))
+        self._startHelper()
+        self.deviceAddr = addr
+        self._writeCmd("conn %s\n" % addr)
+        rsp = self._getResp('stat')
+        while rsp['state'][0] == 'tryconn':
+            rsp = self._getResp('stat')
+        if rsp['state'][0] != 'conn':
+            self._stopHelper()
+            raise BTLEException(BTLEException.DISCONNECTED,
+                                "Failed to connect to peripheral %s" % addr)
 
+    def disconnect(self):
+        if self._helper is None:
+            return
+        self._writeCmd("disc\n")
+        self._getResp('stat')
+        self._stopHelper()
 
     def discoverServices(self):
-        self.send('svcs')
-        def cb(proto, response):
-            assert response['rsp'] == 'svcs'
-            assert isinstance(prooto, Protocol), 'Protocol passed in cb'
-            starts = response['hstart']
-            ends   = response['hend']
-            uuids  = response['uuid']
-            nSvcs = len(uuids)
-            assert(len(starts) == nSvcs and len(ends) == nSvcs)
-            proto.services = {}
-            for i in range(nSvcs):
-                proto.services[UUID(uuids[i])] = Service(proto, uuids[i], starts[i], ends[i])
-            self.discoveredAllServices = True
-            # TODO KA worth to trigger an action/callback
-            return self.services  # TODO remove me, pointless KA
-        self.wait_for_reponse_type('svcs', cb, self)
+        self._writeCmd("svcs\n")
+        rsp = self._getResp('find')
+        starts = rsp['hstart']
+        ends   = rsp['hend']
+        uuids  = rsp['uuid']
+        nSvcs = len(uuids)
+        assert(len(starts)==nSvcs and len(ends)==nSvcs)
+        self.services = {}
+        for i in range(nSvcs):
+            self.services[UUID(uuids[i])] = Service(self, uuids[i], starts[i], ends[i])
+        self.discoveredAllServices = True
+        return self.services
 
     def getServices(self):
         if not self.discoveredAllServices:
             self.discoverServices()
-        # TODO KA find a way to callback
         return self.services.values()
 
     def getServiceByUUID(self, uuidVal):
@@ -395,6 +276,11 @@ class Protocol(object):
         nDesc = len(resp['hnd'])
         return [Descriptor(self, resp['uuid'][i], resp['hnd'][i]) for i in
                 range(nDesc)]
+
+    def readCharacteristic(self, handle):
+        self._writeCmd("rd %X\n" % handle)
+        resp = self._getResp('rd')
+        return resp['d'][0]
 
     def _readCharacteristicByUUID(self, uuid, startHnd, endHnd):
         # Not used at present
@@ -443,20 +329,13 @@ class AssignedNumbers:
 
     @staticmethod
     def getCommonName(uuid):
-        assert isinstance(uuid, UUID), '%s not a UUID instance' % uuid
         return AssignedNumbers.nameMap.get(uuid, None)
-
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
         sys.exit("Usage:\n  %s <mac-address>" % sys.argv[0])
 
     Debugging = False
-    helperExe = os.path.join(os.path.abspath(os.path.dirname(__file__)),
-                             "bluepy-helper")
-    if not os.path.isfile(helperExe):
-        raise ImportError("Cannot find required executable '%s'" % helperExe)
-
     devaddr = sys.argv[1]
     print("Connecting to:", devaddr)
     conn = Peripheral(devaddr)
@@ -469,5 +348,4 @@ if __name__ == '__main__':
                 if chName is not None:
                     print("    ->", chName, repr(ch.read()))
     finally:
-        if conn is not None:
-            conn.disconnect()
+        conn.disconnect()
