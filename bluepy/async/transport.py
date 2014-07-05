@@ -124,8 +124,6 @@ class Transport(object):
             raise BTLEException(BTLEException.INTERNAL_ERROR,
                                 "Helper already connected to %s" % addr)
 
-        logging.debug('writeline: conn %s' % addr)
-
         self.writeline("conn %s" % addr)
 
     def disconnect(self):

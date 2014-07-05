@@ -15,42 +15,41 @@ SEC_LEVEL_MEDIUM = "medium"
 SEC_LEVEL_HIGH = "high"
 
 
-# class Service:
-#    def __init__(self, protocol, uuidVal, hndStart, hndEnd):
-#        self.protocol = protocol
-#        self.uuidVal = uuidVal
-#        self.uuid = UUID(uuidVal)
-#        self.hndStart = hndStart
-#        self.hndEnd = hndEnd
-#        self.characteristics = None
-#
-#    def getCharacteristics(self, forUUID=None, chars_cb=None):
-#        def set_chars(srv, forUUID, result_):
-#            logging.debug('getCharacteristics cb: result %s' % result_)
-#            assert isinstance(result_, dict)
-#
-#            srv.characteristics = result_
-#            cb_result = result_
-#            if forUUID is not None:
-#                u = UUID(forUUID)
-#                cb_result = [ch for ch in srv.characteristics if ch.uuid == u]
-#                logging.debug('forUUID=%s, result now is %s' % (forUUID, cb_result))
-#
-#            return cb_result
-#
-#        if not self.characteristics:  # Unset, or empty
-#            cb = CallbackChain(set_chars, forUUID=forUUID)
-#            cb.put(chars_cb)
-#            self.protocol.getCharacteristics(self.hndStart, self.hndEnd, cb)
-#        else:
-#            final_cb = CallbackChain(chars_cb)
-#            final_cb.set_result(self.characteristics)
-#            self.protocol._call_cb_async(final_cb)
-#
-#    def __str__(self):
-#        return "Service <uuid=%s hadleStart=%s handleEnd=%s>" % (self.uuid,
-#                                                                 self.hndStart,
-#                                                                 self.hndEnd)
+class Service:
+    def __init__(self, protocol, uuidVal, hndStart, hndEnd):
+        self.protocol = protocol
+        self.uuidVal = uuidVal
+        self.uuid = UUID(uuidVal)
+        self.hndStart = hndStart
+        self.hndEnd = hndEnd
+        self.characteristics = None
+
+    def getCharacteristics(self, forUUID=None, chars_cb=None):
+        def set_chars(srv, forUUID, result_):
+            logging.debug('getCharacteristics cb: result %s' % result_)
+
+            srv.characteristics = result_
+            cb_result = result_
+            if forUUID is not None:
+                u = UUID(forUUID)
+                cb_result = [ch for ch in srv.characteristics if ch.uuid == u]
+                logging.debug('forUUID=%s, result now is %s' % (forUUID, cb_result))
+
+            return cb_result
+
+        if not self.characteristics:  # Unset, or empty
+            cb = CallbackChain(set_chars, forUUID=forUUID)
+            cb.put(chars_cb)
+            self.protocol.getCharacteristics(self.hndStart, self.hndEnd, cb)
+        else:
+            final_cb = CallbackChain(chars_cb)
+            final_cb.set_result(self.characteristics)
+            self.protocol._call_cb_async(final_cb)
+
+    def __str__(self):
+        return "Service <uuid=%s hadleStart=%s handleEnd=%s>" % (self.uuid,
+                                                                 self.hndStart,
+                                                                 self.hndEnd)
 
 
 # KA: touched, unstable
@@ -212,7 +211,7 @@ class Protocol(object):
         callback needs to return None
         """
         assert callable(cb), 'default cb for %s is callable' % type_
-
+        logging.debug('add cb %s for type %s', cb, type_)
 
         if isinstance(cb, CallbackChain):
             cb.append_partial_params(*args, **kw)
@@ -298,20 +297,34 @@ class Protocol(object):
 #            self.discoverServices(srvs_cb, *srvs_args, **srvs_kw)
 #        return srvs_cb(result_=self.services.values(), *srvs_args, **srvs_kw)
 #
-#    def getServiceByUUID(self, uuidVal, srvs_cb, *srvs_args, **srvs_kw):
-#        uuid = UUID(uuidVal)
-#        if uuid in self.services:
-#            return self.services[uuid]
-#
-#        self.writeline("svcs %s" % uuid)
-#
-#
-#
-#        rsp = self._getResp('find')
-#        svc = Service(self, uuid, rsp['hstart'][0], rsp['hend'][0])
-#        self.services[uuid] = svc
-#        return svc
-#
+    def getServiceByUUID(self, uuidVal, srvs_cb, *srvs_args, **srvs_kw):
+        """CB returns a Service instance"""
+        uuid = UUID(uuidVal)
+
+        def straight_cb(result_, protocol, uuid):
+            """CB for already stored UUID."""
+            return protocol.services[uuid]
+
+        def get_srvs(result_):
+            """CB for discovering UUID"""
+            svc = Service(self, uuid, result_['hstart'][0], result_['hend'][0])
+            self.services[uuid] = svc
+            return svc
+
+        if uuid in self.services:
+            cb = CallbackChain(straight_cb, self, uuid)
+        else:
+            cb = CallbackChain(get_srvs)
+
+        if callable(srvs_cb):
+            if isinstance(srvs_cb, CallbackChain):
+                srvs_cb.append_partial_params(*srvs_args, **srvs_kw)
+                srvs = srvs_cb
+            else:
+                srvs = CallbackChain(srvs_cb, *srvs_args, **srvs_kw)
+            cb.put(srvs)
+        self.send('svcs %s' % uuid, type_='find', cb=cb)
+
 #    def _getIncludedServices(self, startHnd=1, endHnd=0xFFFF):
 #        # TODO: No working example of this yet
 #        self._writeCmd("incl %X %X\n" % (startHnd, endHnd))
@@ -338,7 +351,7 @@ class Protocol(object):
         cb = CallbackChain(get_chars)
         if callable(chars_cb):
             if isinstance(chars_cb, CallbackChain):
-                chars_cb.append_partial_params(*chars_cb, **chars_kw)
+                chars_cb.append_partial_params(*chars_args, **chars_kw)
                 chars = chars_cb
             else:
                 chars = CallbackChain(chars_cb, *chars_args, **chars_kw)
