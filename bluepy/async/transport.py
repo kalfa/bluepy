@@ -4,6 +4,7 @@ import os
 import subprocess
 
 from .common import BTLEException
+from .callbacks import MultiverseFuture
 
 
 class BLEHelperProcess(object):
@@ -94,7 +95,8 @@ class Transport(object):
         stdin = self.process.stdin if file_ is None else file_
 
         logging.debug('writeline: sent %s' % data)
-        return stdin.write('%s\n' % data)
+        stdin.write('%s\n' % data)
+        return MultiverseFuture()
 
     def readline(self, file_=None):
         assert isinstance(file_, (io.TextIOBase, type(None)))

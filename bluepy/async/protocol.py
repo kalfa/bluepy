@@ -1,13 +1,13 @@
 """Bluetooth Low Energy Python interface."""
 
 import binascii
-import collections
 import logging
-import queue
+
+from functools import partial
 
 from .common import BTLEException
 from .utils import UUID
-from .callbacks import CallbackChain
+from .callbacks import MultiverseFuture
 from .transport import Transport
 
 SEC_LEVEL_LOW = "low"
@@ -24,27 +24,28 @@ class Service:
         self.hndEnd = hndEnd
         self.characteristics = None
 
-    def getCharacteristics(self, forUUID=None, chars_cb=None):
-        def set_chars(srv, forUUID, result_):
-            logging.debug('getCharacteristics cb: result %s' % result_)
+    def getCharacteristics(self, forUUID=None):
+        def set_chars(srv, forUUID, future):
+            srv.characteristics = future.result()
+            logging.debug('getCharacteristics cb: result %s' % srv.characteristics)
 
-            srv.characteristics = result_
-            cb_result = result_
-            if forUUID is not None:
-                u = UUID(forUUID)
-                cb_result = [ch for ch in srv.characteristics if ch.uuid == u]
-                logging.debug('forUUID=%s, result now is %s' % (forUUID, cb_result))
+            if forUUID is None:
+                return srv.characteristics
 
-            return cb_result
+            u = UUID(forUUID)
+            filtered_chars = [ch for ch in srv.characteristics if ch.uuid == u]
+            logging.debug('forUUID=%s, result now is %s' % (forUUID, filtered_chars))
+            return filtered_chars
 
-        if not self.characteristics:  # Unset, or empty
-            cb = CallbackChain(set_chars, forUUID=forUUID)
-            cb.put(chars_cb)
-            self.protocol.getCharacteristics(self.hndStart, self.hndEnd, cb)
+        returned_future = MultiverseFuture()
+        if not self.characteristics:
+            f = self.protocol.getCharacteristics(self.hndStart, self.hndEnd)
+            f.add_done_chained_callback(partial(set_chars, self, forUUID=forUUID))
+            f.add_done_chained_future(returned_future)
         else:
-            final_cb = CallbackChain(chars_cb)
-            final_cb.set_result(self.characteristics)
-            self.protocol._call_cb_async(final_cb)
+            returned_future.set_result(self.characteristics)
+
+        return returned_future
 
     def __str__(self):
         return "Service <uuid=%s hadleStart=%s handleEnd=%s>" % (self.uuid,
@@ -91,22 +92,24 @@ class Protocol(object):
         self.discoveredAllServices = False
         self.__awaiting_responses = {}
 
-        self.__default_cb = {}
-        self.add_default_callback('stat', self.__on_stat)
+        f = self.get_default_handler_for('stat')
+        f.add_done_chained_callback(self.__on_stat)
 
     def init(self, transport):
         assert isinstance(transport, Transport)
 
         self.transport = transport
 
-    def __on_stat(self, result_):
-        logging.debug('default stat CB: %s' % result_)
-        if 'conn' in result_['state']:
+    def __on_stat(self, future):
+        assert future.done(), 'future is not running or pending'
+        result = future.result()
+        logging.debug('default stat CB: %s' % result)
+        if 'conn' in result['state']:
             logging.debug('setting connection state for transport')
-            self.transport._setconnectedstate(dst=result_['dst'],
-                                              mtu=result_['mtu'],
-                                              sec=result_['sec'])
-        elif 'disc' in result_['state']:
+            self.transport._setconnectedstate(dst=result['dst'],
+                                              mtu=result['mtu'],
+                                              sec=result['sec'])
+        elif 'disc' in result['state']:
             logging.debug('disconnect transport')
             self.transport.disconnect()
 
@@ -126,46 +129,6 @@ class Protocol(object):
         else:
             response_type = 'comment'
         return response_type, parsed
-
-    def trigger_callbacks_for_response_type(self, type_, response):
-        q = self.get_callbacks_queue_for_type(type_)
-        default_q = self.__default_cb.get(type_, None)
-        default_at_start = True
-        if default_q is not None:
-            if type_ == 'conn' and 'disc' in response['mode']:
-                # call the 'disconnect' callback as last
-                default_at_start = False
-                # at disconnect time first registered cb should be the last to
-                # be called, last one first.
-                default_q = default_q[:]
-                default_q.reverse()
-
-        def queued_callback_generator(q, default_q, default_at_start):
-            """Return a generator yielding CallbackChain instances"""
-            try:
-                if default_at_start and isinstance(default_q,
-                                                   collections.Iterable):
-                    for cb in default_q:
-                        # it's a reusable cb, set_result will raise on a second
-                        # call
-                        cb.result = response
-                        yield cb
-                while True:
-                    cb = q.get_nowait()
-                    cb.set_result(response)
-                    yield cb
-            except queue.Empty:
-                if not default_at_start and isinstance(default_q,
-                                                       collections.Iterable):
-                    for cb in default_q:
-                        # it's a reusable cb, set_result will raise on a second
-                        # call
-                        cb.result = response
-                        yield cb
-
-                    raise StopIteration()
-
-        return queued_callback_generator(q, default_q, default_at_start)
 
     @staticmethod
     def parse_line(line):
@@ -205,61 +168,8 @@ class Protocol(object):
                 resp[tag].append(val)
         return resp
 
-    def add_default_callback(self, type_, cb, *args, **kw):
-        """Add a cb as default handler for type_
-
-        callback needs to return None
-        """
-        assert callable(cb), 'default cb for %s is callable' % type_
-        logging.debug('add cb %s for type %s', cb, type_)
-
-        if isinstance(cb, CallbackChain):
-            cb.append_partial_params(*args, **kw)
-        else:
-            cb = CallbackChain(cb, *args, **kw)
-
-        if self.__default_cb.get(type_, None) is None:
-            self.__default_cb[type_] = []
-
-        self.__default_cb[type_].append(cb)
-
-    def wait_for_response_type(self, type_, cb, *args, **kw):
-        """Wait to be called back when a selected response arrives
-
-        @param type_: string representing the value of rsp field in the result
-        @param cb: a callable, e.g. a CallbackChain
-        @param args: positional args to be passed to cb. If cb is a
-          CallbackChain, they will be appended as partial args
-        @param kw: keyword args to be passed to cb. If cb is a CallbackChain,
-          they will be appended as partial args.
-        """
-        assert callable(cb), "callback is a callable"
-        if 'result_' in kw:
-            raise RuntimeError('result_ kw arg passed as arg to cb %s' % cb)
-
-        if isinstance(cb, CallbackChain):
-            cb.append_partial_params(*args, **kw)
-            callback_chain = cb
-        else:
-            callback_chain = CallbackChain(cb, *args, **kw)
-        self._append_response_queue_for_type(type_, callback_chain)
-
-    def _call_cb_async(cb, *args, **kw):
-        raise NotImplemented()
-
-    def get_callbacks_queue_for_type(self, type_):
-        return self.__awaiting_responses.get(type_, queue.Queue())
-
-    def _append_response_queue_for_type(self, type_, partial_cb):
-        q = self.__awaiting_responses.get(type_, None)
-        if q is None:
-            q = queue.Queue()
-            self.__awaiting_responses[type_] = q
-        q.put(partial_cb)
-
-    def send(self, cmd, type_, cb, *args, **kw):
-        self.wait_for_response_type(type_, cb, *args, **kw)
-        self.transport.writeline(cmd)
+    def send(self, cmd):
+        return self.transport.writeline(cmd)
 
 #    def status(self):
 #        def cb(response_):
@@ -297,66 +207,54 @@ class Protocol(object):
 #            self.discoverServices(srvs_cb, *srvs_args, **srvs_kw)
 #        return srvs_cb(result_=self.services.values(), *srvs_args, **srvs_kw)
 #
-    def getServiceByUUID(self, uuidVal, srvs_cb, *srvs_args, **srvs_kw):
+    def getServiceByUUID(self, uuidVal):
         """CB returns a Service instance"""
         uuid = UUID(uuidVal)
 
-        def straight_cb(result_, protocol, uuid):
-            """CB for already stored UUID."""
-            return protocol.services[uuid]
-
-        def get_srvs(result_):
+        def get_srvs(future):
             """CB for discovering UUID"""
-            svc = Service(self, uuid, result_['hstart'][0], result_['hend'][0])
+            result = future.result()
+            svc = Service(self, uuid, result['hstart'][0], result['hend'][0])
             self.services[uuid] = svc
             return svc
 
         if uuid in self.services:
-            cb = CallbackChain(straight_cb, self, uuid)
+            f = MultiverseFuture()
+            f.set_result(self.services[uuid])
         else:
-            cb = CallbackChain(get_srvs)
+            f = self.send('svcs %s' % uuid)  # type=find
+            f.add_done_chained_callback(get_srvs)
 
-        if callable(srvs_cb):
-            if isinstance(srvs_cb, CallbackChain):
-                srvs_cb.append_partial_params(*srvs_args, **srvs_kw)
-                srvs = srvs_cb
-            else:
-                srvs = CallbackChain(srvs_cb, *srvs_args, **srvs_kw)
-            cb.put(srvs)
-        self.send('svcs %s' % uuid, type_='find', cb=cb)
+        return f
 
 #    def _getIncludedServices(self, startHnd=1, endHnd=0xFFFF):
 #        # TODO: No working example of this yet
 #        self._writeCmd("incl %X %X\n" % (startHnd, endHnd))
 #        return self._getResp('find')
 
-    def getCharacteristics(self, startHnd=1, endHnd=0xFFFF, uuid=None,
-                           chars_cb=None, *chars_args, **chars_kw):
+    def getCharacteristics(self, startHnd=1, endHnd=0xFFFF, uuid=None):
         cmd = 'char %X %X' % (startHnd, endHnd)
         if uuid:
             cmd += ' %s' % UUID(uuid)
 
-        def get_chars(result_):
-            logging.debug("getCharacteristics: cb resp=%s" % result_)
-            nChars = len(result_['hnd'])
+        def get_chars(future):
+            """Transforms the read result in a list of Characteristic
+            instances"""
+            result = future.result()
+            logging.debug("getCharacteristics: cb resp=%s" % result)
+            nChars = len(result['hnd'])
             ret = [Characteristic(self,
-                                  result_['uuid'][i],
-                                  result_['hnd'][i],
-                                  result_['props'][i],
-                                  result_['vhnd'][i])
+                                  result['uuid'][i],
+                                  result['hnd'][i],
+                                  result['props'][i],
+                                  result['vhnd'][i])
                    for i in range(nChars)]
             logging.debug("getCharacteristics return %s" % ret)
             return ret
 
-        cb = CallbackChain(get_chars)
-        if callable(chars_cb):
-            if isinstance(chars_cb, CallbackChain):
-                chars_cb.append_partial_params(*chars_args, **chars_kw)
-                chars = chars_cb
-            else:
-                chars = CallbackChain(chars_cb, *chars_args, **chars_kw)
-            cb.put(chars)
-        self.send(cmd, type_='find', cb=cb)
+        f = self.send(cmd)
+        f.add_done_chained_callback(get_chars)
+        return f
 
 #    def getDescriptors(self, startHnd=1, endHnd=0xFFFF,
 #                       desc_cb=None, *desc_args, **desc_kw):
@@ -375,25 +273,16 @@ class Protocol(object):
 #        self._writeCmd("rdu %s %X %X\n" % (UUID(uuid), startHnd, endHnd))
 #        return self._getResp('rd')
 
-    def writeCharacteristic(self, handle, val, withResponse=False,
-                            write_cb=None, *write_args, **write_kw):
-        def logger(response_):
-            logging.debug("writeCharacteristic resp %s" % response_)
-            return response_
-
-        cb = CallbackChain(logger)
-        if callable(write_cb):
-            if isinstance(write_cb, CallbackChain):
-                write_cb.append_partial_params(*write_args, **write_kw)
-                writer = write_cb
-            else:
-                writer = CallbackChain(write_cb, *write_args, **write_kw)
-            cb.put(writer)
+    def writeCharacteristic(self, handle, val, withResponse=False):
+        def logger(future):
+            logging.debug("writeCharacteristic resp %s" % future.result())
+            return future
 
         cmd = "wrr" if withResponse else "wr"
-        self.send("%s %X %s\n" % (cmd, handle, binascii.b2a_hex(val)),
-                  type='wr', cb=cb)
-        return self._getResp('wr')
+        f = self.send("%s %X %s\n" % (cmd, handle,
+                                      binascii.b2a_hex(val)))  # type=wr
+        f.add_done_chained_callback(logger)
+        return f
 
 #    def setSecurityLevel(self, level):
 #        self._writeCmd("secu %s\n" % level)
