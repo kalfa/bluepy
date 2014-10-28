@@ -3,3 +3,6 @@ bluepy-helper
 *.o
 *.swp
 .ropeproject
+.tox/
+tags
+TAGS
