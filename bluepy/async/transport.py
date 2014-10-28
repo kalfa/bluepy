@@ -4,7 +4,7 @@ import os
 import subprocess
 
 from .common import BTLEException
-from .callbacks import MultiverseFuture
+from pipedfutures import PipedFuture
 
 
 class BLEHelperProcess(object):
@@ -96,7 +96,7 @@ class Transport(object):
 
         logging.debug('writeline: sent %s' % data)
         stdin.write('%s\n' % data)
-        return MultiverseFuture()
+        return PipedFuture(description='command "%s" sent' % data)
 
     def readline(self, file_=None):
         assert isinstance(file_, (io.TextIOBase, type(None)))
@@ -114,10 +114,10 @@ class Transport(object):
         logging.debug('readline: %s' % data)
         return data
 
-    def _setconnectedstate(self, dst, mtu, sec):
-        self._dst = dst
+    def setconnectedstate(self, destination, mtu, security):
+        self._destination = destination
         self._mtu = mtu
-        self._sec = sec
+        self._security = security
 
     def connect(self, addr):
         assert len(addr.split(":")) == 6, "expected MAC, got %s" % addr

@@ -7,8 +7,9 @@ from functools import partial
 
 from .common import BTLEException
 from .utils import UUID
-from .callbacks import MultiverseFuture
+from pipedfutures import PipedFuture
 from .transport import Transport
+from .results import ResultManager
 
 SEC_LEVEL_LOW = "low"
 SEC_LEVEL_MEDIUM = "medium"
@@ -27,20 +28,23 @@ class Service:
     def getCharacteristics(self, forUUID=None):
         def set_chars(srv, forUUID, future):
             srv.characteristics = future.result()
-            logging.debug('getCharacteristics cb: result %s' % srv.characteristics)
+            logging.debug('getCharacteristics cb: result %s' %
+                          srv.characteristics)
 
             if forUUID is None:
                 return srv.characteristics
 
             u = UUID(forUUID)
             filtered_chars = [ch for ch in srv.characteristics if ch.uuid == u]
-            logging.debug('forUUID=%s, result now is %s' % (forUUID, filtered_chars))
+            logging.debug('forUUID=%s, result now is %s' % (forUUID,
+                                                            filtered_chars))
             return filtered_chars
 
-        returned_future = MultiverseFuture()
+        returned_future = PipedFuture()
         if not self.characteristics:
             f = self.protocol.getCharacteristics(self.hndStart, self.hndEnd)
-            f.add_done_chained_callback(partial(set_chars, self, forUUID=forUUID))
+            f.add_done_chained_callback(partial(set_chars, self,
+                                                forUUID=forUUID))
             f.add_done_chained_future(returned_future)
         else:
             returned_future.set_result(self.characteristics)
@@ -64,7 +68,8 @@ class Characteristic(object):
         self.valHandle = valHandle
 
     def read(self, cb, *args, **kw):
-        self.protocol.send("rd %X" % self.handle, type_='rd', cb=None, *args, **kw)
+        self.protocol.send("rd %X" % self.handle, type_='rd', cb=None, *args,
+                           **kw)
 
     def write(self, val, withResponse=False, cb=None, *args, **kw):
         self.protocol.writeCharacteristic(self.valHandle, val, withResponse,
@@ -87,28 +92,44 @@ class Characteristic(object):
 
 
 class Protocol(object):
+    """Generic Async Protocol class"""
     def __init__(self):
-        self.services = {}  # Indexed by UUID
-        self.discoveredAllServices = False
-        self.__awaiting_responses = {}
+        self.transport = None
 
-        f = self.get_default_handler_for('stat')
+        self.__result_manager = ResultManager()
+
+        self.services = {}  # Indexed by UUID
+        # True if all services have been discovered, so that when True and
+        # getServices() is called, a cached result can be returned instead of
+        # re-requesting again the whole bunch.
+        self.discoveredAllServices = False
+
+        f = self.__result_manager.get_default_handler_for('stat')
         f.add_done_chained_callback(self.__on_stat)
 
     def init(self, transport):
+        """Protocol Initialisaton
+
+        Initial setup for the protocol instance
+
+        @param transport: the transport this instance will use
+        """
         assert isinstance(transport, Transport)
 
         self.transport = transport
 
     def __on_stat(self, future):
+        """Callback to manage an answer to the 'stat' command'
+        """
+        # KA TODO REMOVE assert
         assert future.done(), 'future is not running or pending'
         result = future.result()
-        logging.debug('default stat CB: %s' % result)
+        logging.debug('default stat CB: %s', result)
         if 'conn' in result['state']:
             logging.debug('setting connection state for transport')
-            self.transport._setconnectedstate(dst=result['dst'],
-                                              mtu=result['mtu'],
-                                              sec=result['sec'])
+            self.transport.setconnectedstate(destination=result['dst'],
+                                             mtu=result['mtu'],
+                                             security=result['sec'])
         elif 'disc' in result['state']:
             logging.debug('disconnect transport')
             self.transport.disconnect()
@@ -130,8 +151,16 @@ class Protocol(object):
             response_type = 'comment'
         return response_type, parsed
 
+    # pylint: disable=C0111
     @staticmethod
     def parse_line(line):
+        """Parse line received from the Helper process
+
+        @param line the received line
+
+        @returns the a dictionary with the parsed response, which may be empty
+        if no information is given by @c line, e.g. a comment.
+        """
         resp = {}
 
         line = line.strip()
@@ -219,7 +248,7 @@ class Protocol(object):
             return svc
 
         if uuid in self.services:
-            f = MultiverseFuture()
+            f = PipedFuture()
             f.set_result(self.services[uuid])
         else:
             f = self.send('svcs %s' % uuid)  # type=find
@@ -275,7 +304,7 @@ class Protocol(object):
 
     def writeCharacteristic(self, handle, val, withResponse=False):
         def logger(future):
-            logging.debug("writeCharacteristic resp %s" % future.result())
+            logging.debug("writeCharacteristic resp %s", future.result())
             return future
 
         cmd = "wrr" if withResponse else "wr"
